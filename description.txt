@@ -1,0 +1,205 @@
+================================================================================
+FUEL ROUTE OPTIMIZER API — SYSTEM DESCRIPTION
+================================================================================
+
+OVERVIEW
+--------
+This is a Django 6.0 REST API that calculates the most cost-effective fuel stops
+for a road trip between any two locations in the United States. You give it a
+start and a finish, and it returns the full driving route, every fuel stop you
+should make (optimized for price), and the total fuel cost broken down leg by leg.
+
+LIVE ENDPOINTS
+--------------
+  JSON API:  GET http://127.0.0.1:8000/api/route/?start=New York, NY&finish=Los Angeles, CA
+  Map view:  GET http://127.0.0.1:8000/api/route/map/?start=New York, NY&finish=Los Angeles, CA
+
+TECH STACK
+----------
+  - Framework:      Django 6.0.6 (Python 3.12)
+  - API layer:      Django REST Framework 3.17
+  - Routing API:    OSRM (Open Source Routing Machine) — free, no API key needed
+  - Geocoding:      Nominatim (OpenStreetMap) — free, no API key needed
+  - Station data:   Pre-loaded from the supplied fuel-prices CSV (8,151 US stations)
+  - Offline coords: SimpleMaps US Cities table joined at load time (never at request time)
+  - Database:       SQLite (zero setup)
+  - Map rendering:  Folium (interactive Leaflet.js map)
+  - Caching:        Django in-memory cache (geocodes cached 24h, routes cached 1h)
+
+THE KEY ARCHITECTURAL DECISION — ONE ROUTING CALL
+--------------------------------------------------
+The core requirement was: "one call to the map/route API is ideal."
+
+Here is exactly how that is achieved:
+
+  1. The two endpoint names (start, finish) are geocoded to lat/lng via Nominatim.
+     These results are cached for 24 hours, so repeat queries cost zero external calls.
+
+  2. ONE single call is made to the OSRM routing API. This returns the full route
+     geometry (34,000+ lat/lng points for NY to LA) and the total distance in one response.
+
+  3. Everything else — finding nearby fuel stations, picking the cheapest stops,
+     computing the cost — is done entirely in Python against data already in the
+     local SQLite database. No further external calls are made.
+
+  Per request: 1 routing call + up to 2 geocoding calls (both cached after first use).
+  Cached repeat requests: 0 external calls, responds in ~200ms.
+
+VEHICLE ASSUMPTIONS
+-------------------
+  - Tank range:  500 miles (configurable in fuelroute/settings.py)
+  - Fuel economy: 10 miles per gallon (configurable in fuelroute/settings.py)
+  - Start tank:  Assumed full at origin
+  - Cost model:  First leg billed at first stop's price (driver tops up on arrival);
+                 each subsequent leg billed at the station that fueled it.
+                 Total gallons = total_distance / mpg exactly.
+
+THE FUEL OPTIMIZER ALGORITHM
+-----------------------------
+The optimizer uses a greedy, cost-effective strategy:
+
+  Step 1 — Build route points:
+    The raw OSRM geometry (list of [lng, lat] coordinates) is converted into a list
+    of points each tagged with its cumulative mileage from the start.
+
+  Step 2 — Downsample:
+    The ~34,000 route points are reduced to one point every 5 miles. This speeds up
+    station matching with no meaningful accuracy loss at a 5-mile search buffer.
+
+  Step 3 — Find stations near the route (grid index):
+    A spatial grid (0.5-degree cells) is built from the downsampled points. Each fuel
+    station checks only its neighboring grid cells instead of every route point.
+    Stations within 5 miles of the route are kept, sorted by their distance along
+    the route. This makes the matching near-linear in speed even with 8,000 stations.
+
+  Step 4 — Greedy stop selection:
+    Starting from mile 0, while the remaining distance exceeds one tank (500 miles):
+      - Look at every station reachable within the next 500 miles.
+      - Pick the CHEAPEST one in that window.
+      - Drive there, set it as the new position, repeat.
+    This guarantees every hop is within range while favouring low prices.
+
+  Step 5 — Cost breakdown:
+    The route is split into legs (origin → stop 1 → stop 2 → ... → destination).
+    Each leg's cost = (leg miles / mpg) × price at the station that fueled that leg.
+    All legs sum to exactly total_distance / mpg gallons.
+
+  Note: A provably optimal strategy would carry only enough fuel to reach the next
+  cheaper station and fill the tank fully only when no cheaper station is ahead.
+  The greedy approach was chosen for clarity and explainability — it produces
+  near-optimal results in practice and is easy to reason about.
+
+DATA PIPELINE (ONE-TIME SETUP)
+-------------------------------
+  1. Fuel prices CSV (~8,151 US truck stops) is provided with the assignment.
+     Columns used: Truckstop Name, Address, City, State, Retail Price.
+
+  2. US Cities lat/lng table (SimpleMaps Basic, free under CC BY 4.0) provides
+     coordinates for ~31,000 US cities.
+
+  3. The load_fuel_data management command joins the two on (City, State), writing
+     lat/lng directly onto each FuelStation record. This runs once offline.
+     Result: 8,151 stations in SQLite, 6,934 (85%) with coordinates.
+
+  The 15% without coordinates are small towns not present in the cities table
+  (e.g. tiny hamlets, Canadian border stations). They are silently skipped by the
+  optimizer — the remaining 85% provides dense enough coverage across all US highways.
+
+API RESPONSE FIELDS
+-------------------
+  start                     — geocoded origin (query, lat, lng)
+  finish                    — geocoded destination (query, lat, lng)
+  total_distance_miles      — full driving distance
+  vehicle                   — range and mpg assumptions used
+  total_gallons             — total fuel for the trip (= distance / mpg)
+  total_fuel_cost_usd       — total dollar cost
+  fuel_stops[]              — ordered list of stops, each with:
+                                name, address, city, state
+                                price_per_gallon
+                                distance_along_route_miles
+                                detour_miles (how far off the highway)
+                                lat, lng
+  cost_breakdown[]          — per-leg breakdown: from/to mile, gallons, price, cost
+  route_geometry            — GeoJSON LineString of the full driving route
+
+GUARANTEES ON EVERY RESPONSE
+-----------------------------
+  - Every gap between consecutive fuel stops is <= 500 miles (vehicle never runs dry)
+  - Every detour is <= 5 miles off the main route
+  - total_gallons = total_distance_miles / 10 exactly
+  - Cheapest available station is always chosen within each mandatory refuel window
+
+CACHING BEHAVIOUR
+-----------------
+  - Geocode results:   cached 24 hours (Nominatim, per place name)
+  - Full route result: cached 1 hour (keyed on start + finish pair)
+  - Second call to the same route: ~200ms, zero external API calls
+
+ERROR HANDLING
+--------------
+  - Unrecognised location:      400 {"error": "Could not geocode location: ..."}
+  - No station within range:    400 {"error": "No fuel station within range ..."}
+  - Missing query parameters:   400 {"error": "Provide both 'start' and 'finish'..."}
+  - OSRM cannot find a route:   400 {"error": "No route found between the given locations."}
+
+EXAMPLE: NEW YORK, NY → LOS ANGELES, CA
+-----------------------------------------
+  Distance:      2,793.9 miles
+  Fuel stops:    12 stops
+  Total gallons: 279.39
+  Total cost:    $868.05
+  Largest gap:   495.8 miles (safely under 500)
+  Largest detour: 4.23 miles (safely under 5)
+
+  Stop 1:  SHEETZ #639, Youngstown, OH          — $3.059/gal — mile 391.6
+  Stop 2:  QUIKTRIP #7203, Peru, IL             — $2.969/gal — mile 860.9
+  Stop 3:  Henderson Fuel Mart, Henderson, NE   — $2.899/gal — mile 1356.7
+  Stop 4:  AM ENERGY, Overton, NE               — $2.899/gal — mile 1448.2
+  Stop 5:  FATDOGS LEXINGTON, Lexington, NE     — $2.979/gal — mile 1458.6
+  Stop 6:  FATDOGS OGALLALA, Ogallala, NE       — $3.014/gal — mile 1571.5
+  Stop 7:  BIG SPRINGS T&T, Big Springs, NE     — $3.074/gal — mile 1587.3
+  Stop 8:  7-ELEVEN 42279, Keenesburg, CO       — $3.149/gal — mile 1740.3
+  Stop 9:  GOOD 2 GO #713, Brighton, CO         — $3.199/gal — mile 1760.8
+  Stop 10: PWI #502, Golden, CO                 — $3.199/gal — mile 1791.0
+  Stop 11: MAVERIK #693, Green River, UT        — $3.282/gal — mile 2123.1
+  Stop 12: Maverik #674, North Las Vegas, NV    — $3.282/gal — mile 2518.8
+
+EXAMPLE: CHICAGO, IL → DALLAS, TX
+------------------------------------
+  Distance:      967.0 miles
+  Fuel stops:    2 stops
+  Total gallons: 96.7
+  Total cost:    $281.40
+
+  Stop 1:  HUCKS FOOD & FUEL #379, Marion, IL   — $2.929/gal — mile 314.5
+  Stop 2:  EXTRA MILE TRUCK STOP, Hooks, TX     — $2.817/gal — mile 803.8
+
+PROJECT STRUCTURE
+-----------------
+  fuelroute/
+    settings.py                         — Django config, vehicle assumptions
+    urls.py                             — root URL router
+  routing/
+    models.py                           — FuelStation model (SQLite)
+    views.py                            — RouteAPIView, RouteMapView
+    urls.py                             — /api/route/ and /api/route/map/
+    tests.py                            — 3 unit tests (all passing)
+    services/
+      geocoding.py                      — Nominatim geocoder with 24h cache
+      routing_api.py                    — single OSRM call (ORS fallback)
+      fuel_optimizer.py                 — haversine, grid index, greedy planner, cost
+      trip.py                           — orchestrates all services per request
+    management/commands/
+      load_fuel_data.py                 — one-time CSV loader + offline geocoding
+  data/
+    fuel-prices-for-be-assessment.csv   — supplied fuel price data
+    uscities.csv                        — SimpleMaps US cities lat/lng table
+
+SETUP COMMANDS (from scratch)
+------------------------------
+  py -3 manage.py migrate
+  py -3 manage.py load_fuel_data
+  py -3 manage.py test
+  py -3 manage.py runserver
+
+================================================================================
